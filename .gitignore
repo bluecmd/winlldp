@@ -1,0 +1,9 @@
+*.exe
+*.dll
+*.log
+*.etl
+*.obj
+*.pdb
+bin/
+obj/
+LldpSender.conf

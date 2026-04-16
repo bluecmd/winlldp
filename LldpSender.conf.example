@@ -1,0 +1,17 @@
+# LldpSender configuration
+#
+# Each line defines a physical adapter to send LLDP on:
+#   AdapterGUID,MACAddress,PortName
+#
+# AdapterGUID: The Windows network adapter GUID (from Get-NetAdapter -Physical)
+# MACAddress:  The adapter's MAC address (with or without separators)
+# PortName:    Human-readable name sent in the LLDP Port ID TLV
+#
+# If this file is absent, the service auto-discovers physical Ethernet adapters.
+#
+# Find your adapter GUIDs and MACs with:
+#   Get-NetAdapter -Physical | Select-Object Name, InterfaceGuid, MacAddress
+
+# Example:
+# {7F2D754B-6031-4989-9698-7C5169055D41},0C-C4-7A-CF-AE-9E,Ethernet
+# {74847FBD-103C-4F34-A4E1-F7F2C84FEB20},0C-C4-7A-CF-AE-9F,Ethernet 2
