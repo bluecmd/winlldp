@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.ServiceProcess;
 using System.Threading;
 using SharpPcap;
@@ -34,6 +36,7 @@ public class LldpSender : ServiceBase
     private Thread _worker;
     private bool _running;
     private string _baseDir;
+    private List<AdapterInfo> _adapters;
 
     static readonly byte[] LldpMulticast = new byte[] { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e };
     const int SendIntervalMs = 30000;
@@ -62,16 +65,16 @@ public class LldpSender : ServiceBase
     private void Run()
     {
         Log("Service starting");
-        List<AdapterInfo> adapters = LoadAdapters();
-        Log("Configured adapters: " + adapters.Count);
-        foreach (AdapterInfo a in adapters)
+        _adapters = LoadAdapters();
+        Log("Configured adapters: " + _adapters.Count);
+        foreach (AdapterInfo a in _adapters)
         {
             Log("  " + a.PortName + " GUID=" + a.Guid + " MAC=" + a.MacHex);
         }
 
         while (_running)
         {
-            try { SendOnAdapters(adapters); }
+            try { SendOnAdapters(_adapters); }
             catch (Exception ex) { Log("Error: " + ex.ToString()); }
             for (int i = 0; i < SendIntervalMs / 1000 && _running; i++)
                 Thread.Sleep(1000);
@@ -181,13 +184,16 @@ public class LldpSender : ServiceBase
                 continue;
             }
 
+            List<IPAddress> mgmtAddrs = GetManagementAddresses(adapter.Guid);
+
             try
             {
                 matchedDev.Open(DeviceMode.Promiscuous);
-                byte[] frame = BuildLldpFrame(mac, Environment.MachineName, adapter.PortName);
+                byte[] frame = BuildLldpFrame(mac, Environment.MachineName, adapter.PortName, mgmtAddrs);
                 matchedDev.SendPacket(frame);
                 matchedDev.Close();
-                Log("Sent LLDP on " + adapter.PortName + " MAC=" + BitConverter.ToString(mac));
+                Log("Sent LLDP on " + adapter.PortName + " MAC=" + BitConverter.ToString(mac)
+                    + " mgmt=" + string.Join(",", mgmtAddrs.ConvertAll(a => a.ToString()).ToArray()));
             }
             catch (Exception ex)
             {
@@ -195,6 +201,103 @@ public class LldpSender : ServiceBase
                 Log("Failed on " + adapter.PortName + ": " + ex.Message);
             }
         }
+    }
+
+    /// <summary>
+    /// Find management addresses for the given adapter.
+    /// Checks the adapter itself first, then falls back to any adapter
+    /// whose MAC matches (handles Hyper-V vSwitch where the physical NIC
+    /// is hidden from .NET and IPs live on the vEthernet adapter sharing
+    /// the physical adapter's MAC).
+    /// Returns at most one IPv4 and one IPv6 address.
+    /// </summary>
+    private List<IPAddress> GetManagementAddresses(string adapterGuid)
+    {
+        List<IPAddress> result = new List<IPAddress>();
+        byte[] targetMac = ParseMac(GetMacForAdapter(adapterGuid));
+
+        // Try the adapter itself first (if visible to .NET)
+        foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (string.Equals(nic.Id, adapterGuid, StringComparison.OrdinalIgnoreCase))
+            {
+                if (targetMac == null)
+                    targetMac = nic.GetPhysicalAddress().GetAddressBytes();
+                CollectAddresses(nic, result);
+                break;
+            }
+        }
+
+        // If we found addresses directly, use those
+        if (result.Count > 0) return result;
+
+        // Otherwise look for any adapter with the same MAC
+        // (Hyper-V external switch hides the physical NIC from .NET but
+        // the vEthernet host adapter shares the same MAC and holds the IPs)
+        if (targetMac != null && targetMac.Length == 6)
+        {
+            foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (string.Equals(nic.Id, adapterGuid, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                byte[] nicMac = nic.GetPhysicalAddress().GetAddressBytes();
+                if (nicMac.Length == 6 && MacEqual(nicMac, targetMac))
+                {
+                    CollectAddresses(nic, result);
+                    if (result.Count > 0) break;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Look up the MAC for an adapter from the known adapter list.
+    /// This handles the case where the physical NIC is hidden from
+    /// NetworkInterface.GetAllNetworkInterfaces() by a Hyper-V vSwitch.
+    /// </summary>
+    private string GetMacForAdapter(string adapterGuid)
+    {
+        if (_adapters == null) return null;
+        foreach (AdapterInfo a in _adapters)
+        {
+            if (string.Equals(a.Guid, adapterGuid, StringComparison.OrdinalIgnoreCase))
+                return a.MacHex;
+        }
+        return null;
+    }
+
+    private static void CollectAddresses(NetworkInterface nic, List<IPAddress> result)
+    {
+        IPInterfaceProperties props = nic.GetIPProperties();
+        bool hasV4 = false;
+        bool hasV6 = false;
+        foreach (UnicastIPAddressInformation addr in props.UnicastAddresses)
+        {
+            if (!hasV4 && addr.Address.AddressFamily == AddressFamily.InterNetwork)
+            {
+                // Skip link-local (169.254.0.0/16)
+                byte[] bytes = addr.Address.GetAddressBytes();
+                if (bytes[0] == 169 && bytes[1] == 254) continue;
+                result.Add(addr.Address);
+                hasV4 = true;
+            }
+            else if (!hasV6 && addr.Address.AddressFamily == AddressFamily.InterNetworkV6
+                     && !addr.Address.IsIPv6LinkLocal)
+            {
+                result.Add(addr.Address);
+                hasV6 = true;
+            }
+            if (hasV4 && hasV6) break;
+        }
+    }
+
+    private static bool MacEqual(byte[] a, byte[] b)
+    {
+        for (int i = 0; i < 6; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 
     private string _logPath;
@@ -223,7 +326,8 @@ public class LldpSender : ServiceBase
         return mac;
     }
 
-    static byte[] BuildLldpFrame(byte[] srcMac, string sysName, string portName)
+    static byte[] BuildLldpFrame(byte[] srcMac, string sysName, string portName,
+        List<IPAddress> mgmtAddrs)
     {
         List<byte[]> tlvs = new List<byte[]>();
 
@@ -244,6 +348,12 @@ public class LldpSender : ServiceBase
         // System Description TLV (type 6)
         tlvs.Add(MakeTlv(6, System.Text.Encoding.ASCII.GetBytes(
             "Windows " + Environment.OSVersion.Version.ToString())));
+
+        // Management Address TLVs (type 8)
+        foreach (IPAddress addr in mgmtAddrs)
+        {
+            tlvs.Add(BuildMgmtAddrTlv(addr));
+        }
 
         // End TLV (type 0)
         tlvs.Add(new byte[] { 0, 0 });
@@ -266,6 +376,41 @@ public class LldpSender : ServiceBase
             offset += tlv.Length;
         }
         return frame;
+    }
+
+    /// <summary>
+    /// Build a Management Address TLV (type 8) per IEEE 802.1AB.
+    /// Layout:
+    ///   1 byte  - management address string length (1 + addr bytes)
+    ///   1 byte  - address subtype (1 = IPv4, 2 = IPv6, per IANA ianaAddressFamilyNumbers)
+    ///   N bytes - address
+    ///   1 byte  - interface numbering subtype (2 = ifIndex)
+    ///   4 bytes - interface number (0 = unknown)
+    ///   1 byte  - OID string length (0 = none)
+    /// </summary>
+    static byte[] BuildMgmtAddrTlv(IPAddress addr)
+    {
+        byte[] addrBytes = addr.GetAddressBytes();
+        // IANA address family: 1 = IPv4, 2 = IPv6
+        byte addrSubtype = (byte)(addr.AddressFamily == AddressFamily.InterNetwork ? 1 : 2);
+        byte addrStrLen = (byte)(1 + addrBytes.Length);
+
+        // Total value: addrStrLen(1) + subtype(1) + addr(N) + ifSubtype(1) + ifNumber(4) + oidLen(1)
+        byte[] value = new byte[1 + 1 + addrBytes.Length + 1 + 4 + 1];
+        int pos = 0;
+        value[pos++] = addrStrLen;
+        value[pos++] = addrSubtype;
+        Array.Copy(addrBytes, 0, value, pos, addrBytes.Length);
+        pos += addrBytes.Length;
+        value[pos++] = 2; // interface numbering subtype: ifIndex
+        // interface number: 0 (unknown)
+        value[pos++] = 0;
+        value[pos++] = 0;
+        value[pos++] = 0;
+        value[pos++] = 0;
+        value[pos++] = 0; // OID string length: 0
+
+        return MakeTlv(8, value);
     }
 
     static byte[] MakeTlv(int type, byte[] value)

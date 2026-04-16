@@ -85,6 +85,13 @@ Get-NetAdapter -Physical | Select-Object Name, InterfaceGuid, MacAddress
 | TTL | 120 seconds |
 | System Name | Windows hostname |
 | System Description | Windows version |
+| Management Address | IPv4 and/or IPv6 unicast address (if available) |
+
+Management addresses are discovered automatically. When a physical NIC is
+behind a Hyper-V external virtual switch, the NIC is hidden from .NET's
+`NetworkInterface` API. In this case, the service finds the corresponding
+`vEthernet` host adapter by matching MAC addresses and reports its IP.
+Link-local addresses (169.254.x.x and fe80::) are excluded.
 
 ## How it works
 
